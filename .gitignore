@@ -1,5 +1,7 @@
 # Log files
-*.log
+logs/
+.roo/
+.cursor/
 
 # Python cache
 __pycache__/
@@ -28,3 +30,5 @@ build/
 # IDE and tool specific directories
 .cursor/
 .roo/ 
+
+*repomix*

@@ -22,6 +22,7 @@ DEFAULT_MATCH_METHOD = "ccoeff_normed"
 DEFAULT_THRESHOLD = 0.8
 DEFAULT_CANNY_T1 = 50
 DEFAULT_CANNY_T2 = 150
+DEFAULT_FILTER_PARAM_CANNY_T1 = 50
 
 # Cache Settings
 DEFAULT_TEMPLATE_CACHE_SIZE = 1000
@@ -42,18 +43,41 @@ FILTER_TYPES = ["none", "canny"]
 CV2_MATCH_METHODS = {
     "ccoeff_normed": "cv2.TM_CCOEFF_NORMED",
     "sqdiff_normed": "cv2.TM_SQDIFF_NORMED",
-    "ccorr_normed": "cv2.TM_CCORR_NORMED"
+    "ccorr_normed": "cv2.TM_CCORR_NORMED",
 }
 
 # HTTP Response Fields
 RESPONSE_FIELDS = [
-    "found", "center_x", "center_y", "template_name", "template_path",
-    "score", "top_left_x", "top_left_y", "width", "height",
-    "top_left_x_with_offset", "top_left_y_with_offset",
-    "offset_applied_x", "offset_applied_y", "verify_wait",
-    "verify_confirmed", "verify_score", "recheck_status",
-    "recheck_frame_timestamp", "search_region_x1", "search_region_y1",
-    "search_region_x2", "search_region_y2", "search_region_full_search",
-    "filter_type_used", "match_method_used", "frame_timestamp",
-    "frame_width", "frame_height", "threshold", "highest_score", "error"
-] 
+    "found",
+    "center_x",
+    "center_y",
+    "template_name",
+    "template_path",
+    "score",
+    "top_left_x",
+    "top_left_y",
+    "width",
+    "height",
+    "top_left_x_with_offset",
+    "top_left_y_with_offset",
+    "offset_applied_x",
+    "offset_applied_y",
+    "verify_wait",
+    "verify_confirmed",
+    "verify_score",
+    "recheck_status",
+    "recheck_frame_timestamp",
+    "search_region_x1",
+    "search_region_y1",
+    "search_region_x2",
+    "search_region_y2",
+    "search_region_full_search",
+    "filter_type_used",
+    "match_method_used",
+    "frame_timestamp",
+    "frame_width",
+    "frame_height",
+    "threshold",
+    "highest_score",
+    "error",
+]

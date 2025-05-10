@@ -1,0 +1,1 @@
+manager.py start --port 60003 --mjpeg-url "http://192.168.1.3:8080/stream.mjpeg?clientId=ljcvJAyJxsh1hHen"
