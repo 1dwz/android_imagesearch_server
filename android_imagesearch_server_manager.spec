@@ -1,0 +1,44 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+
+a = Analysis(
+    ['manager.py'],
+    pathex=[],
+    binaries=[],
+    datas=[('multi_config.json', '.'), ('config', 'config'), ('logs', 'logs')],
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='android_imagesearch_server_manager',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='android_imagesearch_server_manager',
+)
