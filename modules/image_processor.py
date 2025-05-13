@@ -5,8 +5,7 @@ Provides template matching and image filtering functionality
 """
 import logging
 import os
-import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -16,100 +15,93 @@ from modules.constants import (
     DEFAULT_CANNY_T2,
     DEFAULT_FILTER_TYPE,
     DEFAULT_MATCH_METHOD,
+    DEFAULT_TEMPLATE_CACHE_SIZE,
     DEFAULT_THRESHOLD,
 )
+from modules.datatypes import (
+    FilterProcessingError,
+    FilterType,
+    ParameterValidator,
+    ResourceNotFoundError,
+    TemplateLoadError,
+    TemplateMatchError,
+    ValidationError,
+)
+from modules.state_managers import TemplateCache
 
 logger = logging.getLogger(__name__)
-
-
-# LRU Template Cache for improved performance
-class TemplateCache:
-    """Simple LRU Cache for processed template images"""
-
-    def __init__(self, max_size: int = 1000):
-        """Initialize template cache with maximum size"""
-        self.cache: Dict[str, Dict[str, Any]] = {}
-        self.max_size = max_size
-        self.access_times: Dict[str, float] = {}
-        logger.info(f"Template cache initialized with max size: {max_size}")
-
-    def get(self, key: str) -> Optional[Dict[str, Any]]:
-        """Get template from cache if it exists"""
-        if key in self.cache:
-            self.access_times[key] = time.time()
-            return self.cache[key]
-        return None
-
-    def put(self, key: str, template_data: Dict[str, Any]) -> None:
-        """Add template to cache, possibly evicting oldest entries"""
-        # Check if cache is full and needs eviction
-        if len(self.cache) >= self.max_size:
-            # Find least recently used entry
-            oldest_key = min(
-                self.access_times.keys(), key=lambda k: self.access_times[k]
-            )
-            # Remove it
-            del self.cache[oldest_key]
-            del self.access_times[oldest_key]
-
-        # Add new entry
-        self.cache[key] = template_data
-        self.access_times[key] = time.time()
-
-    def clear(self) -> None:
-        """Clear the template cache"""
-        self.cache.clear()
-        self.access_times.clear()
-        logger.info("Template cache cleared")
 
 
 # Image Processor Class
 class ImageProcessor:
     """
-    Handles image processing operations including template loading,
-    preprocessing with filters, and template matching.
+    处理图像处理操作，包括模板加载、预处理过滤和模板匹配。
     """
 
     def __init__(self, config: Dict[str, Any]):
         """
-        Initialize the image processor
+        初始化图像处理器
 
         Args:
-            config: Configuration dictionary with default settings
+            config: 包含默认设置的配置字典
         """
         self.config = config
-        self.template_cache = TemplateCache(config.get("template_cache_size", 1000))
-        logger.info("Image processor initialized")
+        self.template_cache = TemplateCache(
+            config.get("template_cache_size", DEFAULT_TEMPLATE_CACHE_SIZE)
+        )
+        logger.info("图像处理器已初始化")
 
-    def _load_template(self, template_path: str) -> Optional[np.ndarray]:
+    def _load_template(self, template_path: str) -> np.ndarray:
         """
-        Load template image from disk
+        从磁盘加载模板图像
 
         Args:
-            template_path: Path to template image
+            template_path: 模板图像的路径
 
         Returns:
-            Template image as numpy array or None if loading failed
+            模板图像的 numpy 数组
+
+        Raises:
+            ResourceNotFoundError: 当模板文件不存在时
+            TemplateLoadError: 当模板加载或解码失败时
         """
-        if not os.path.exists(template_path):
-            logger.error(f"Template file not found: {template_path}")
-            return None
-
         try:
-            template = cv2.imread(template_path)
-            if template is None:
-                logger.error(f"Failed to load template: {template_path}")
-                return None
+            # 验证图像格式
+            template_path = ParameterValidator.validate_image_format(template_path)
 
-            # Convert to grayscale for matching
-            if len(template.shape) == 3:
-                template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            if not os.path.exists(template_path):
+                raise ResourceNotFoundError(
+                    message=f"未找到模板文件: {template_path}",
+                    details={"path": template_path},
+                )
+
+            # 使用 imdecode 进行健壮的路径处理
+            with open(template_path, "rb") as f_img:
+                img_bytes = f_img.read()
+
+            # 使用 OpenCV 将图像字节直接解码为灰度图
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            template = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+
+            if template is None:
+                raise TemplateLoadError(
+                    message=f"解码模板图像失败: {template_path}",
+                    details={"path": template_path, "error": "cv2.imdecode 返回 None"},
+                )
 
             return template
 
+        except (ValidationError, ResourceNotFoundError):
+            raise
         except Exception as e:
-            logger.error(f"Error loading template {template_path}: {e}")
-            return None
+            raise TemplateLoadError(
+                message=f"加载模板时出错: {template_path}",
+                details={
+                    "path": template_path,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
 
     def _preprocess_image(
         self,
@@ -119,373 +111,367 @@ class ImageProcessor:
         canny_t2: int = DEFAULT_CANNY_T2,
     ) -> np.ndarray:
         """
-        Apply preprocessing filters to an image
+        对图像应用预处理过滤器
 
         Args:
-            image: Input image (grayscale)
-            filter_type: Filter type to apply ('none' or 'canny')
-            canny_t1: Low threshold for Canny edge detection
-            canny_t2: High threshold for Canny edge detection
+            image: 输入图像（灰度）
+            filter_type: 过滤器类型 ('none' 或 'canny')
+            canny_t1: Canny 边缘检测的低阈值
+            canny_t2: Canny 边缘检测的高阈值
 
         Returns:
-            Processed image
-        """
-        # Ensure image is grayscale
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
+            处理后的图像
 
-        # Apply filter
-        if filter_type.lower() == "canny":
-            try:
-                return cv2.Canny(gray, canny_t1, canny_t2)
-            except Exception as e:
-                logger.error(f"Error applying Canny filter: {e}")
+        Raises:
+            ValidationError: 当参数验证失败时
+            FilterProcessingError: 当图像处理失败时
+        """
+        try:
+            # 验证过滤器类型
+            filter_type = FilterType.validate(filter_type)
+
+            # 确保图像是灰度图
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image.copy()
+
+            # 应用过滤器
+            if filter_type == FilterType.CANNY:
+                # 验证 Canny 参数
+                t1, t2 = ParameterValidator.validate_canny_params(canny_t1, canny_t2)
+                try:
+                    return cv2.Canny(gray, t1, t2)
+                except Exception as e:
+                    raise FilterProcessingError(
+                        message="应用 Canny 过滤器失败",
+                        details={"t1": t1, "t2": t2, "error": str(e)},
+                    )
+            else:
                 return gray
-        else:
-            # Default is 'none' - just return grayscale
-            return gray
+
+        except ValidationError:
+            raise
+        except Exception as e:
+            raise FilterProcessingError(
+                message="图像预处理失败",
+                details={
+                    "filter_type": filter_type,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
 
     def _get_match_method_cv2(self, method_str: str) -> int:
         """
-        Get the OpenCV constant for match method
+        获取 OpenCV 匹配方法常量
 
         Args:
-            method_str: Name of match method ('ccoeff_normed', 'sqdiff_normed', or 'ccorr_normed')
+            method_str: 匹配方法名称
 
         Returns:
-            OpenCV constant for match method
+            OpenCV 匹配方法常量
+
+        Raises:
+            ValidationError: 当匹配方法无效时
         """
         method_map = {
             "ccoeff_normed": cv2.TM_CCOEFF_NORMED,
             "sqdiff_normed": cv2.TM_SQDIFF_NORMED,
             "ccorr_normed": cv2.TM_CCORR_NORMED,
+            "sqdiff": cv2.TM_SQDIFF,
+            "ccoeff": cv2.TM_CCOEFF,
+            "ccorr": cv2.TM_CCORR,
         }
-        return method_map.get(method_str.lower(), cv2.TM_CCOEFF_NORMED)
+
+        try:
+            method = method_map.get(method_str.lower())
+            if method is None:
+                raise ValidationError(
+                    message=f"无效的匹配方法: {method_str}",
+                    details={
+                        "provided": method_str,
+                        "valid_methods": list(method_map.keys()),
+                    },
+                )
+            return method
+        except AttributeError:
+            raise ValidationError(
+                message="匹配方法必须是字符串类型",
+                details={"provided_type": type(method_str).__name__},
+            )
 
     def _calculate_score(self, match_val: float, method_str: str) -> float:
         """
-        Calculate normalized score (0.0-1.0) for match value
+        计算归一化的匹配分数 (0.0-1.0)
 
         Args:
-            match_val: Raw match value from cv2.matchTemplate
-            method_str: Match method used
+            match_val: cv2.matchTemplate 的原始匹配值
+            method_str: 使用的匹配方法
 
         Returns:
-            Normalized score (higher is better)
+            归一化分数（越高越好）
         """
-        # For TM_SQDIFF_NORMED, 0 is perfect match and 1 is worst match
-        # For other methods, 1 is perfect match and -1 is worst match
-        if method_str.lower() == "sqdiff_normed":
-            return 1.0 - match_val  # Invert so higher is better
-        return max(0.0, match_val)  # Ensure non-negative
+        try:
+            if method_str.lower() == "sqdiff_normed":
+                return 1.0 - match_val  # 反转使得越高越好
+            return max(0.0, match_val)  # 确保非负
+        except Exception as e:
+            raise ValidationError(
+                message="计算匹配分数失败",
+                details={"match_val": match_val, "method": method_str, "error": str(e)},
+            )
 
-    def _generate_cache_key(
+    def _get_template(
         self,
         template_path: str,
-        filter_type: str,
-        canny_t1: int = None,
-        canny_t2: int = None,
-    ) -> str:
+        filter_type_str: str,
+        canny_t1: Optional[int] = None,
+        canny_t2: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int, int]:
         """
-        Generate cache key for template
+        从缓存获取处理过的模板，如果不存在则加载并处理。
 
         Args:
-            template_path: Path to template image
-            filter_type: Filter type applied
-            canny_t1: Canny low threshold (if applicable)
-            canny_t2: Canny high threshold (if applicable)
+            template_path: 模板图像的路径
+            filter_type_str: 过滤器类型字符串
+            canny_t1: Canny 边缘检测的低阈值
+            canny_t2: Canny 边缘检测的高阈值
 
         Returns:
-            Cache key string
+            处理过的模板数据元组 (processed_template, width, height)
+
+        Raises:
+            ValidationError: 当参数验证失败时
+            ResourceNotFoundError: 当模板文件不存在时
+            TemplateLoadError: 当模板加载失败时
+            FilterProcessingError: 当图像处理失败时
         """
-        key = f"{template_path}|{filter_type}"
-        if (
-            filter_type.lower() == "canny"
-            and canny_t1 is not None
-            and canny_t2 is not None
-        ):
-            key += f"|{canny_t1}|{canny_t2}"
-        return key
+        try:
+            # 验证并转换 filter_type 字符串为 FilterType 枚举
+            filter_type_enum = FilterType.validate(filter_type_str)
 
-    def _get_cached_template(
-        self,
-        template_path: str,
-        filter_type: str,
-        canny_t1: int = None,
-        canny_t2: int = None,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Get processed template from cache or create and cache it
+            # 准备过滤器参数
+            filter_params = {}
+            if filter_type_enum == FilterType.CANNY:
+                # 使用默认值或提供的值
+                c1_eff = (
+                    canny_t1
+                    if canny_t1 is not None
+                    else self.config.get("default_canny_t1", DEFAULT_CANNY_T1)
+                )
+                c2_eff = (
+                    canny_t2
+                    if canny_t2 is not None
+                    else self.config.get("default_canny_t2", DEFAULT_CANNY_T2)
+                )
+                filter_params["canny_t1"] = c1_eff
+                filter_params["canny_t2"] = c2_eff
 
-        Args:
-            template_path: Path to template image
-            filter_type: Filter type to apply
-            canny_t1: Canny low threshold (if applicable)
-            canny_t2: Canny high threshold (if applicable)
+            # 从缓存获取
+            cached_template = self.template_cache.get_template(
+                template_path, filter_type_enum, filter_params
+            )
 
-        Returns:
-            Dictionary with processed template and metadata or None if failed
-        """
-        cache_key = self._generate_cache_key(
-            template_path, filter_type, canny_t1, canny_t2
-        )
+            if cached_template is not None:
+                logger.debug(
+                    f"模板 {template_path} (filter: {filter_type_str}) 从缓存加载"
+                )
+                return cached_template
 
-        # Check cache first
-        cached = self.template_cache.get(cache_key)
-        if cached:
-            return cached
+            # 加载并处理模板
+            logger.debug(
+                f"模板 {template_path} (filter: {filter_type_str}) 缓存未命中，正在处理..."
+            )
+            template = self._load_template(template_path)
+            processed = self._preprocess_image(
+                template,
+                filter_type_str,
+                filter_params.get("canny_t1"),
+                filter_params.get("canny_t2"),
+            )
 
-        # Load and process template
-        template = self._load_template(template_path)
-        if template is None:
-            return None
+            # 获取尺寸
+            height, width = processed.shape[:2]
 
-        # Process template with filter
-        processed_template = self._preprocess_image(
-            template,
-            filter_type,
-            canny_t1 or DEFAULT_CANNY_T1,
-            canny_t2 or DEFAULT_CANNY_T2,
-        )
+            # 存入缓存
+            template_data = (processed, width, height)
+            self.template_cache.store_template(
+                template_path, filter_type_enum, filter_params, template_data
+            )
 
-        # Create template data
-        template_data = {
-            "original": template,
-            "processed": processed_template,
-            "width": processed_template.shape[1],
-            "height": processed_template.shape[0],
-            "path": template_path,
-            "name": os.path.basename(template_path),
-            "filter_type": filter_type,
-        }
+            return template_data
 
-        # Cache it
-        self.template_cache.put(cache_key, template_data)
-        return template_data
+        except Exception as e:
+            if isinstance(
+                e,
+                (
+                    ValidationError,
+                    ResourceNotFoundError,
+                    TemplateLoadError,
+                    FilterProcessingError,
+                ),
+            ):
+                raise
+            raise TemplateLoadError(
+                message="处理模板时发生未知错误",
+                details={
+                    "template_path": template_path,
+                    "filter_type": filter_type_str,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
 
     def match_template(
         self, frame: np.ndarray, template_path: str, params: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Match template in frame using parameters
+        在帧中搜索模板图像
 
         Args:
-            frame: Source frame to search in
-            template_path: Path to template image
-            params: Dictionary of matching parameters
+            frame: 要搜索的帧图像
+            template_path: 模板图像的路径
+            params: 匹配参数字典，包括：
+                - filter_type: 过滤器类型 ('none' 或 'canny')
+                - match_method: 匹配方法
+                - threshold: 匹配阈值
+                - x1, y1, x2, y2: 搜索区域坐标
+                - offsetx, offsety: 结果坐标偏移
+                - canny_t1, canny_t2: Canny 边缘检测参数
 
         Returns:
-            Dictionary with match results
+            匹配结果字典
+
+        Raises:
+            ValidationError: 当参数验证失败时
+            ResourceNotFoundError: 当模板文件不存在时
+            TemplateLoadError: 当模板加载失败时
+            FilterProcessingError: 当图像处理失败时
+            TemplateMatchError: 当模板匹配失败时
         """
-        # Extract parameters with defaults from config
-        filter_type = params.get(
-            "filter_type", self.config.get("default_filter_type", DEFAULT_FILTER_TYPE)
-        )
-        match_method = params.get(
-            "match_method",
-            self.config.get("default_match_method", DEFAULT_MATCH_METHOD),
-        )
-        threshold = float(
-            params.get(
-                "threshold", self.config.get("default_threshold", DEFAULT_THRESHOLD)
-            )
-        )
-
-        # Extract Canny parameters if needed
-        canny_t1 = None
-        canny_t2 = None
-        if filter_type.lower() == "canny":
-            canny_t1 = int(
-                params.get(
-                    "canny_t1", self.config.get("default_canny_t1", DEFAULT_CANNY_T1)
-                )
-            )
-            canny_t2 = int(
-                params.get(
-                    "canny_t2", self.config.get("default_canny_t2", DEFAULT_CANNY_T2)
-                )
+        try:
+            # 提取和验证参数
+            filter_type = params.get("filter_type", DEFAULT_FILTER_TYPE)
+            match_method = params.get("match_method", DEFAULT_MATCH_METHOD)
+            threshold = ParameterValidator.validate_threshold(
+                params.get("threshold", DEFAULT_THRESHOLD)
             )
 
-        # Load and prepare template
-        template_data = self._get_cached_template(
-            template_path, filter_type, canny_t1, canny_t2
-        )
-        if not template_data:
-            return {
-                "found": False,
-                "error": f"Failed to load template: {template_path}",
-                "filter_type_used": filter_type,
-                "match_method_used": match_method,
-                "threshold": threshold,
-            }
+            # 获取处理后的模板
+            template, template_width, template_height = self._get_template(
+                template_path,
+                filter_type,
+                params.get("canny_t1"),
+                params.get("canny_t2"),
+            )
 
-        # Get frame dimensions
-        frame_height, frame_width = frame.shape[:2]
+            # 预处理帧图像
+            processed_frame = self._preprocess_image(
+                frame,
+                filter_type,
+                params.get("canny_t1"),
+                params.get("canny_t2"),
+            )
 
-        # Extract search region parameters
-        x1 = params.get("match_range_x1")
-        y1 = params.get("match_range_y1")
-        x2 = params.get("match_range_x2")
-        y2 = params.get("match_range_y2")
+            # 验证并获取搜索区域
+            frame_height, frame_width = processed_frame.shape[:2]
+            search_region = ParameterValidator.validate_search_region(
+                params.get("x1"),
+                params.get("y1"),
+                params.get("x2"),
+                params.get("y2"),
+                frame_width,
+                frame_height,
+            )
 
-        # Initialize search region to full frame
-        search_region = {"x1": 0, "y1": 0, "x2": frame_width, "y2": frame_height}
-        full_search = True
-
-        # Apply search region if all coordinates are provided
-        if all(coord is not None for coord in [x1, y1, x2, y2]):
-            # Convert to int and validate
-            try:
-                x1, y1 = max(0, int(x1)), max(0, int(y1))
-                x2, y2 = min(frame_width, int(x2)), min(frame_height, int(y2))
-
-                # Ensure x1 < x2 and y1 < y2
-                if x1 >= x2 or y1 >= y2:
-                    logger.warning(
-                        f"Invalid search region: ({x1},{y1})-({x2},{y2}). Using full frame."
-                    )
-                else:
-                    search_region = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
-                    full_search = False
-                    logger.debug(f"Using search region: ({x1},{y1})-({x2},{y2})")
-            except (ValueError, TypeError) as e:
-                logger.warning(
-                    f"Error parsing search region coordinates: {e}. Using full frame."
-                )
-
-        # Extract region from frame
-        if full_search:
-            region = frame
-        else:
-            region = frame[
+            # 提取搜索区域
+            roi = processed_frame[
                 search_region["y1"] : search_region["y2"],
                 search_region["x1"] : search_region["x2"],
             ]
 
-        # Apply the same preprocessing to the frame
-        processed_region = self._preprocess_image(
-            region,
-            filter_type,
-            canny_t1 or DEFAULT_CANNY_T1,
-            canny_t2 or DEFAULT_CANNY_T2,
-        )
-
-        # Get template
-        template = template_data["processed"]
-
-        # Check if template is larger than search region
-        if (
-            template.shape[0] > processed_region.shape[0]
-            or template.shape[1] > processed_region.shape[1]
-        ):
-            return {
-                "found": False,
-                "error": "Template is larger than search region",
-                "filter_type_used": filter_type,
-                "match_method_used": match_method,
-                "threshold": threshold,
-                "search_region_x1": search_region["x1"],
-                "search_region_y1": search_region["y1"],
-                "search_region_x2": search_region["x2"],
-                "search_region_y2": search_region["y2"],
-                "search_region_full_search": full_search,
-                "highest_score": 0.0,
-                "frame_width": frame_width,
-                "frame_height": frame_height,
-            }
-
-        # Perform template matching
-        try:
-            cv2_method = self._get_match_method_cv2(match_method)
-            result = cv2.matchTemplate(processed_region, template, cv2_method)
-
-            # Find the best match location
-            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-
-            # Calculate score based on match method
-            if match_method.lower() == "sqdiff_normed":
-                match_loc = min_loc
-                score = self._calculate_score(min_val, match_method)
-                highest_score = self._calculate_score(min_val, match_method)
-            else:
-                match_loc = max_loc
-                score = self._calculate_score(max_val, match_method)
-                highest_score = self._calculate_score(max_val, match_method)
-
-            # Add search region offset to coordinates
-            if not full_search:
-                match_loc = (
-                    match_loc[0] + search_region["x1"],
-                    match_loc[1] + search_region["y1"],
+            # 验证 ROI 大小
+            if roi.shape[0] < template.shape[0] or roi.shape[1] < template.shape[1]:
+                raise ValidationError(
+                    message="搜索区域小于模板尺寸",
+                    details={
+                        "roi_size": roi.shape[:2],
+                        "template_size": template.shape[:2],
+                    },
                 )
 
-            # Convert match location to result coordinates
-            top_left_x, top_left_y = match_loc
-            width, height = template_data["width"], template_data["height"]
-            center_x = top_left_x + width // 2
-            center_y = top_left_y + height // 2
+            # 执行模板匹配
+            try:
+                cv2_method = self._get_match_method_cv2(match_method)
+                result = cv2.matchTemplate(roi, template, cv2_method)
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+            except Exception as e:
+                raise TemplateMatchError(
+                    message="模板匹配失败",
+                    details={"method": match_method, "error": str(e)},
+                )
 
-            # Apply offsets if provided
-            offset_x = int(params.get("offset_x", 0))
-            offset_y = int(params.get("offset_y", 0))
+            # 计算匹配分数和位置
+            match_val = min_val if match_method == "sqdiff_normed" else max_val
+            score = self._calculate_score(match_val, match_method)
 
-            # Check if the match exceeds the threshold
-            found = score >= threshold
+            # 获取最佳匹配位置
+            best_loc = min_loc if match_method == "sqdiff_normed" else max_loc
 
-            # Create result dictionary
+            # 计算中心点和偏移
+            x = best_loc[0] + template_width // 2
+            y = best_loc[1] + template_height // 2
+
+            # 添加搜索区域偏移
+            x += search_region["x1"]
+            y += search_region["y1"]
+
+            # 添加用户指定的偏移
+            offsetx = params.get("offsetx", 0)
+            offsety = params.get("offsety", 0)
+            x += offsetx
+            y += offsety
+
+            # 构建结果
+            success = score >= threshold
             result = {
-                "found": found,
-                "center_x": center_x + offset_x,
-                "center_y": center_y + offset_y,
-                "template_name": template_data["name"],
-                "template_path": template_data["path"],
+                "success": success,
                 "score": score,
-                "top_left_x": top_left_x,
-                "top_left_y": top_left_y,
-                "width": width,
-                "height": height,
-                "top_left_x_with_offset": top_left_x + offset_x,
-                "top_left_y_with_offset": top_left_y + offset_y,
-                "offset_applied_x": offset_x,
-                "offset_applied_y": offset_y,
-                "verify_wait": 0.0,
-                "verify_confirmed": False,
-                "verify_score": None,
-                "recheck_status": "Not performed",
-                "recheck_frame_timestamp": None,
-                "search_region_x1": search_region["x1"],
-                "search_region_y1": search_region["y1"],
-                "search_region_x2": search_region["x2"],
-                "search_region_y2": search_region["y2"],
-                "search_region_full_search": full_search,
-                "filter_type_used": filter_type,
-                "match_method_used": match_method,
-                "frame_timestamp": time.time(),
-                "frame_width": frame_width,
-                "frame_height": frame_height,
                 "threshold": threshold,
-                "highest_score": highest_score,
-                "error": None,
+                "center_x": x,
+                "center_y": y,
+                "top_left_x": x - template_width // 2,
+                "top_left_y": y - template_height // 2,
+                "width": template_width,
+                "height": template_height,
+                "processing_details": {
+                    "filter_type": filter_type,
+                    "match_method": match_method,
+                    "search_region": search_region,
+                    "offset": {"x": offsetx, "y": offsety},
+                },
             }
 
             return result
 
         except Exception as e:
-            logger.error(f"Error during template matching: {e}")
-            return {
-                "found": False,
-                "error": f"Template matching error: {str(e)}",
-                "filter_type_used": filter_type,
-                "match_method_used": match_method,
-                "threshold": threshold,
-                "search_region_x1": search_region["x1"],
-                "search_region_y1": search_region["y1"],
-                "search_region_x2": search_region["x2"],
-                "search_region_y2": search_region["y2"],
-                "search_region_full_search": full_search,
-                "highest_score": 0.0,
-                "frame_width": frame_width,
-                "frame_height": frame_height,
-            }
+            if isinstance(
+                e,
+                (
+                    ValidationError,
+                    ResourceNotFoundError,
+                    TemplateLoadError,
+                    FilterProcessingError,
+                    TemplateMatchError,
+                ),
+            ):
+                raise
+            raise TemplateMatchError(
+                message="模板匹配过程中发生未知错误",
+                details={
+                    "template_path": template_path,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )

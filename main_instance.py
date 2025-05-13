@@ -16,9 +16,31 @@ from modules.constants import SERVER_VERSION
 from modules.utils import parse_ini_file
 
 # Configure logger
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+logger_root = logging.getLogger()
+logger_root.setLevel(logging.INFO)
+
+# 创建格式化器
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+# 确保控制台输出使用 UTF-8 编码 (特别是 Windows)
+try:
+    if sys.stdout.encoding != "utf-8":
+        # 重新打开 sys.stdout 并指定编码
+        sys.stdout = open(
+            sys.stdout.fileno(), mode="w", encoding="utf-8", buffering=1
+        )  # buffering=1 for line buffering
+        # 如果需要，也可以对 stderr 进行同样的操作
+        # sys.stderr = open(sys.stderr.fileno(), mode='w', encoding='utf-8', buffering=1)
+except Exception as e:
+    # 如果发生错误（例如，在不支持 fileno() 的环境中），记录警告但继续
+    # 在某些交互式环境中可能会出现问题
+    logger_root.warning(f"无法设置控制台输出编码为 UTF-8: {e}. 日志输出可能出现乱码。")
+
+# 控制台处理器，现在应该使用 UTF-8 输出
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+logger_root.addHandler(console_handler)
+
 logger = logging.getLogger(__name__)
 
 

@@ -20,7 +20,7 @@ from .constants import (
     DEFAULT_CANNY_T2,
     DEFAULT_TEMPLATE_CACHE_SIZE,
 )
-from .datatypes import FilterType
+from .datatypes import CacheError, FilterType, TemplateCacheEntry
 
 logger = logging.getLogger(__name__)
 
@@ -191,31 +191,42 @@ class TemplateCache:
     def _generate_cache_key(
         self, tpl_path: str, filter_type: FilterType, filter_params: Dict[str, Any]
     ) -> str:
-        """Generate a unique key for the template based on path and processing params."""
-        # Start with the template path
-        key_elements = [str(tpl_path)]
+        """
+        生成基于模板路径和处理参数的唯一缓存键。
 
-        # Add filter type
-        key_elements.append(filter_type.value)
+        Args:
+            tpl_path: 模板路径
+            filter_type: 过滤器类型
+            filter_params: 过滤器参数
 
-        # Add filter parameters if applicable
-        if filter_type == FilterType.CANNY:
-            # Extract and add parameters specific to Canny filter
-            canny_t1 = filter_params.get("canny_t1", DEFAULT_CANNY_T1)
-            canny_t2 = filter_params.get("canny_t2", DEFAULT_CANNY_T2)
-            key_elements.append(f"t1={canny_t1}")
-            key_elements.append(f"t2={canny_t2}")
+        Returns:
+            缓存键字符串
 
-        # Join all elements with a separator
-        key_str = "|".join(key_elements)
+        Raises:
+            CacheError: 当生成缓存键失败时
+        """
+        try:
+            # 开始构建键元素
+            key_elements = [str(tpl_path), filter_type.value]
 
-        # Create a hash of the key string for shorter keys
-        key_hash = hashlib.md5(key_str.encode()).hexdigest()[:CACHE_KEY_HASH_LENGTH]
+            # 添加过滤器参数
+            if filter_type == FilterType.CANNY:
+                t1 = filter_params.get("canny_t1", DEFAULT_CANNY_T1)
+                t2 = filter_params.get("canny_t2", DEFAULT_CANNY_T2)
+                key_elements.extend([str(t1), str(t2)])
 
-        # Final key format: tpl_filename|filter_type|hash
-        final_key = f"{Path(tpl_path).stem}|{filter_type.value}|{key_hash}"
-        logger.debug(f"Generated cache key: {final_key} for template {tpl_path}")
-        return final_key
+            # 生成键字符串
+            key_str = "|".join(key_elements)
+
+            # 创建哈希
+            key_hash = hashlib.sha256(key_str.encode()).hexdigest()[
+                :CACHE_KEY_HASH_LENGTH
+            ]
+
+            return f"{key_hash}_{Path(tpl_path).name}"
+
+        except Exception as e:
+            raise CacheError(f"生成缓存键时出错: {e}")
 
     def store_template(
         self,
@@ -224,98 +235,102 @@ class TemplateCache:
         filter_params: Dict[str, Any],
         template_data: Tuple[np.ndarray, int, int],
     ) -> None:
-        """Store a processed template in the cache with the given parameters."""
-        key = self._generate_cache_key(tpl_path, filter_type, filter_params)
-        with self._lock:
-            # Remove if exists to update position in OrderedDict (LRU)
-            if key in self._cache:
-                self._cache.pop(key)
+        """
+        将处理过的模板存储到缓存中。
 
-            # Add to cache
-            self._cache[key] = template_data
-            logger.debug(f"Template cached: {key}")
+        Args:
+            tpl_path: 模板路径
+            filter_type: 过滤器类型
+            filter_params: 过滤器参数
+            template_data: 模板数据元组 (processed_template, width, height)
 
-            # Trim cache if necessary
-            if len(self._cache) > self._max_size:
-                # OrderedDict remembers insertion order, so first item is oldest
-                oldest_key, _ = self._cache.popitem(last=False)
-                logger.debug(
-                    f"Cache limit reached, removed oldest template: {oldest_key}"
+        Raises:
+            CacheError: 当存储模板失败时
+        """
+        try:
+            key = self._generate_cache_key(tpl_path, filter_type, filter_params)
+            with self._lock:
+                # 检查缓存大小并在需要时清除旧条目
+                if len(self._cache) >= self._max_size:
+                    # 移除最旧的条目
+                    self._cache.popitem(last=False)
+                    logger.debug("已从缓存中移除最旧的模板")
+
+                # 存储新模板
+                self._cache[key] = TemplateCacheEntry(
+                    processed_template=template_data[0],
+                    width=template_data[1],
+                    height=template_data[2],
+                    processing_details=f"Filter: {filter_type.value}, Params: {filter_params}",
                 )
+                logger.debug(f"已将模板存储到缓存中，键: {key}")
+
+        except Exception as e:
+            raise CacheError(f"存储模板到缓存时出错: {e}")
 
     def get_template(
         self, tpl_path: str, filter_type: FilterType, filter_params: Dict[str, Any]
     ) -> Optional[Tuple[np.ndarray, int, int]]:
-        """Retrieve a processed template from the cache if it exists."""
-        key = self._generate_cache_key(tpl_path, filter_type, filter_params)
-        with self._lock:
-            if key in self._cache:
-                # Move to end (most recently used)
-                template_data = self._cache.pop(key)
-                self._cache[key] = template_data
-                logger.debug(f"Template cache hit: {key}")
-                return template_data
-            logger.debug(f"Template cache miss: {key}")
-            return None
-
-    # 添加更简单的API以匹配新的模板处理逻辑
-    def get(self, key: str) -> Optional[Tuple[np.ndarray, int, int, str]]:
         """
-        获取缓存中的模板数据。
+        从缓存获取处理过的模板。
 
         Args:
-            key: 缓存键
+            tpl_path: 模板路径
+            filter_type: 过滤器类型
+            filter_params: 过滤器参数
 
         Returns:
-            如果命中，返回缓存的模板数据，否则返回None
+            模板数据元组 (processed_template, width, height) 或 None
+
+        Raises:
+            CacheError: 当获取模板失败时
         """
-        with self._lock:
-            if key in self._cache:
-                # 更新LRU顺序
-                template_data = self._cache.pop(key)
-                self._cache[key] = template_data
-                logger.debug(f"Template cache hit: {key}")
-                return template_data
-            logger.debug(f"Template cache miss: {key}")
-            return None
+        try:
+            key = self._generate_cache_key(tpl_path, filter_type, filter_params)
+            with self._lock:
+                if key in self._cache:
+                    # 移动到最近使用的位置
+                    entry = self._cache.pop(key)
+                    self._cache[key] = entry
+                    logger.debug(f"从缓存中获取到模板，键: {key}")
+                    return (entry.processed_template, entry.width, entry.height)
+                logger.debug(f"缓存中未找到模板，键: {key}")
+                return None
 
-    def set(self, key: str, template_data: Tuple[np.ndarray, int, int, str]) -> None:
-        """
-        将处理后的模板存储到缓存中。
-
-        Args:
-            key: 缓存键
-            template_data: 模板数据，包含(处理后图像, 原始高度, 原始宽度, 处理描述)
-        """
-        with self._lock:
-            # 如果已存在，先移除以更新LRU顺序
-            if key in self._cache:
-                self._cache.pop(key)
-
-            # 添加到缓存
-            self._cache[key] = template_data
-            logger.debug(f"Template cached: {key}")
-
-            # 如有必要，移除最旧的条目
-            if len(self._cache) > self._max_size:
-                oldest_key, _ = self._cache.popitem(last=False)
-                logger.debug(
-                    f"Cache limit reached, removed oldest template: {oldest_key}"
-                )
+        except Exception as e:
+            raise CacheError(f"从缓存获取模板时出错: {e}")
 
     def clear(self) -> None:
-        """Clear all entries from the cache."""
-        logger.debug("Clearing template cache")
-        with self._lock:
-            self._cache.clear()
-            logger.debug("Template cache cleared")
+        """
+        清除缓存中的所有条目。
+
+        Raises:
+            CacheError: 当清除缓存失败时
+        """
+        try:
+            with self._lock:
+                self._cache.clear()
+                logger.debug("已清除模板缓存")
+        except Exception as e:
+            raise CacheError(f"清除缓存时出错: {e}")
 
     def get_size(self) -> int:
-        """Get the current number of items in the cache."""
-        with self._lock:
-            size = len(self._cache)
-            logger.debug(f"Template cache current size: {size}")
-            return size
+        """
+        获取当前缓存大小。
+
+        Returns:
+            缓存中的条目数量
+
+        Raises:
+            CacheError: 当获取缓存大小失败时
+        """
+        try:
+            with self._lock:
+                size = len(self._cache)
+                logger.debug(f"当前缓存大小: {size}")
+                return size
+        except Exception as e:
+            raise CacheError(f"获取缓存大小时出错: {e}")
 
 
 # --- MJPEGStreamManager ---

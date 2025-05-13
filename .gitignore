@@ -26,9 +26,11 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+*.
 
 # IDE and tool specific directories
 .cursor/
 .roo/ 
 
 *repomix*
+pylint*

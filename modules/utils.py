@@ -9,6 +9,9 @@ import os
 import time
 from typing import Any, Dict, Optional
 
+import cv2
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,200 +62,108 @@ ini_cache = INICache()
 
 def parse_ini_file(ini_path: str) -> Dict[str, Any]:
     """
-    Parse an INI file and extract settings
+    解析 INI 文件并提取设置
 
     Args:
-        ini_path: Path to INI file
+        ini_path: INI 文件的路径
 
     Returns:
-        Dictionary with settings from [MatchSettings] section
+        包含 [MatchSettings] 部分设置的字典
 
     Raises:
-        FileNotFoundError: If the INI file does not exist
-        ValueError: If the INI file has missing required sections or invalid data
+        FileNotFoundError: 如果 INI 文件不存在
+        ValueError: 如果 INI 文件缺少必需的部分或数据无效
     """
-    # Check cache first
+    # 首先检查缓存
     cached_data = ini_cache.get(ini_path)
     if cached_data:
         return cached_data
 
-    # Strip potential whitespace and newlines from the path
+    # 去除路径中可能的空白和换行符
     ini_path = ini_path.strip()
 
-    # Check if file exists
+    # 检查文件是否存在
     if not os.path.exists(ini_path):
-        logger.error(f"INI file not found: {ini_path}")
-        raise FileNotFoundError(f"INI file not found: {ini_path}")
+        logger.error(f"未找到 INI 文件: {ini_path}")
+        raise FileNotFoundError(f"未找到 INI 文件: {ini_path}")
 
     try:
-        # Create parser and read the file
+        # 创建解析器并读取文件
         config = configparser.ConfigParser()
         config.read(ini_path, encoding="utf-8")
 
-        # Check if [MatchSettings] section exists
+        # 检查是否存在 [MatchSettings] 部分
         if "MatchSettings" not in config:
-            logger.error(f"Missing [MatchSettings] section in {ini_path}")
-            raise ValueError(f"Missing [MatchSettings] section in {ini_path}")
+            logger.error(f"在 {ini_path} 中缺少 [MatchSettings] 部分")
+            raise ValueError(f"在 {ini_path} 中缺少 [MatchSettings] 部分")
 
-        # Extract settings from [MatchSettings] section
+        # 从 [MatchSettings] 部分提取设置并进行类型转换
         settings = {}
-        for key, value in config["MatchSettings"].items():
-            # Convert empty strings to None
-            if value.strip() == "":
+        # 定义预期的类型映射
+        expected_types = {
+            "threshold": float,
+            "match_range_x1": int,
+            "match_range_y1": int,
+            "match_range_x2": int,
+            "match_range_y2": int,
+            "offset_x": int,
+            "offset_y": int,
+            "waitforrecheck": float,
+            # 注意：server.ini 中的类型转换应该在读取 server.ini 的地方处理，
+            # 如果 parse_ini_file 仅用于 MatchSettings，则此处只包含 MatchSettings 的键。
+            # 如果 parse_ini_file 被设计为通用，则需要更复杂的类型映射逻辑。
+            # 假设它主要用于 MatchSettings:
+            "canny_t1": int,
+            "canny_t2": int,
+        }
+
+        for key, value_str in config["MatchSettings"].items():
+            value_str = value_str.strip()
+            if value_str == "":
                 settings[key] = None
+            elif key in expected_types:
+                try:
+                    # 尝试将值转换为期望的类型
+                    settings[key] = expected_types[key](value_str)
+                except ValueError as e:
+                    logger.warning(
+                        f"无法将 INI 值 '{value_str}' (键: {key}) 转换为类型 {expected_types[key]}. 错误: {e}. 保留为字符串."
+                    )
+                    settings[key] = value_str  # 转换失败时保留为字符串
             else:
-                settings[key] = value
+                # 对于没有定义预期类型的键，保留为字符串
+                settings[key] = value_str
 
-        # Add derived template path (replace .ini with .jpg)
-        ini_basename = os.path.basename(ini_path)
-        template_name = os.path.splitext(ini_basename)[0] + ".jpg"
-        template_dir = os.path.dirname(ini_path)
-        template_path = os.path.join(template_dir, template_name)
+        # 检查是否已在 INI 文件中指定了 template_path
+        if "template_path" not in settings or not settings["template_path"]:
+            # 如果未指定，则派生模板路径（将 .ini 替换为 .jpg）
+            ini_basename = os.path.basename(ini_path)
+            template_name = os.path.splitext(ini_basename)[0] + ".jpg"
+            template_dir = os.path.dirname(ini_path)
+            template_path = os.path.join(template_dir, template_name)
+            settings["template_path"] = template_path
+            logger.debug(f"使用派生的模板路径: {template_path}")
+        else:
+            # 如果指定了相对路径，将其转换为相对于 INI 文件的绝对路径
+            template_path = settings["template_path"]
+            if not os.path.isabs(template_path):
+                template_path = os.path.join(os.path.dirname(ini_path), template_path)
+                settings["template_path"] = template_path
+            logger.debug(f"使用 INI 文件中指定的模板路径: {template_path}")
 
-        settings["template_path"] = template_path
         settings["ini_path"] = ini_path
 
-        # Cache the parsed data
+        # 缓存解析的数据
         ini_cache.put(ini_path, settings)
 
         return settings
 
     except configparser.Error as e:
-        logger.error(f"Error parsing INI file {ini_path}: {e}")
-        raise ValueError(f"Error parsing INI file: {e}")
+        logger.error(f"解析 INI 文件 {ini_path} 时出错: {e}")
+        raise ValueError(f"解析 INI 文件时出错: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error parsing INI file {ini_path}: {e}")
+        logger.error(f"解析 INI 文件 {ini_path} 时发生意外错误: {e}")
         raise
-
-
-def parse_query_params(params: Dict[str, str]) -> Dict[str, Any]:
-    """
-    Parse and convert query parameters from API request
-
-    Args:
-        params: Raw query parameters from request
-
-    Returns:
-        Dictionary with properly typed parameters
-    """
-    result = {}
-
-    # Process each parameter
-    for key, value in params.items():
-        # Skip empty values
-        if value is None or value.strip() == "":
-            continue
-
-        # Convert boolean values
-        if value.lower() in ("true", "yes", "1"):
-            result[key] = True
-        elif value.lower() in ("false", "no", "0"):
-            result[key] = False
-        else:
-            # Try to convert to number if possible
-            try:
-                if "." in value:
-                    result[key] = float(value)
-                else:
-                    result[key] = int(value)
-            except ValueError:
-                # Keep as string if not a number
-                result[key] = value
-
-    return result
-
-
-def get_match_range_params(params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extract and normalize match range parameters
-
-    Args:
-        params: Parameters dictionary
-
-    Returns:
-        Dictionary with normalized match range parameters
-    """
-    result = {}
-
-    # Handle both x1/y1/x2/y2 (from /search) and match_range_x1/etc (from INI)
-    if "x1" in params:
-        result["match_range_x1"] = params["x1"]
-    elif "match_range_x1" in params:
-        result["match_range_x1"] = params["match_range_x1"]
-
-    if "y1" in params:
-        result["match_range_y1"] = params["y1"]
-    elif "match_range_y1" in params:
-        result["match_range_y1"] = params["match_range_y1"]
-
-    if "x2" in params:
-        result["match_range_x2"] = params["x2"]
-    elif "match_range_x2" in params:
-        result["match_range_x2"] = params["match_range_x2"]
-
-    if "y2" in params:
-        result["match_range_y2"] = params["y2"]
-    elif "match_range_y2" in params:
-        result["match_range_y2"] = params["match_range_y2"]
-
-    # Handle offset parameters
-    if "offsetx" in params:
-        result["offset_x"] = params["offsetx"]
-    elif "offset_x" in params:
-        result["offset_x"] = params["offset_x"]
-
-    if "offsety" in params:
-        result["offset_y"] = params["offsety"]
-    elif "offset_y" in params:
-        result["offset_y"] = params["offset_y"]
-
-    return result
-
-
-def validate_filter_type(filter_type: str) -> str:
-    """
-    Validate filter type and return normalized value
-
-    Args:
-        filter_type: Filter type to validate
-
-    Returns:
-        Normalized filter type
-
-    Raises:
-        ValueError: If filter type is invalid
-    """
-    valid_types = ["none", "canny"]
-    normalized = filter_type.lower() if filter_type else "none"
-
-    if normalized not in valid_types:
-        logger.warning(f"Invalid filter type: {filter_type}. Using 'none'.")
-        return "none"
-
-    return normalized
-
-
-def validate_match_method(match_method: str) -> str:
-    """
-    Validate match method and return normalized value
-
-    Args:
-        match_method: Match method to validate
-
-    Returns:
-        Normalized match method
-
-    Raises:
-        ValueError: If match method is invalid
-    """
-    valid_methods = ["ccoeff_normed", "sqdiff_normed", "ccorr_normed"]
-    normalized = match_method.lower() if match_method else "ccoeff_normed"
-
-    if normalized not in valid_methods:
-        logger.warning(f"Invalid match method: {match_method}. Using 'ccoeff_normed'.")
-        return "ccoeff_normed"
-
-    return normalized
 
 
 def clean_debug_images(debug_dir: str, max_files: int = 100) -> None:
@@ -295,44 +206,47 @@ def clean_debug_images(debug_dir: str, max_files: int = 100) -> None:
 
 
 def save_debug_frame(
-    frame, debug_dir: str, prefix: str = "frame", max_files: int = 100
+    frame: np.ndarray,
+    debug_dir: str,
+    prefix: str = "frame",
+    max_files: int = 100,
 ) -> Optional[str]:
     """
-    Save a debug frame to disk
+    保存调试帧图像到指定目录。
 
     Args:
-        frame: Frame to save (numpy array)
-        debug_dir: Directory to save frame in
-        prefix: Filename prefix
-        max_files: Maximum number of files to keep
+        frame: 要保存的帧图像
+        debug_dir: 保存目录
+        prefix: 文件名前缀
+        max_files: 目录中保留的最大文件数
 
     Returns:
-        Path to saved file or None if saving failed
+        保存的文件路径，如果保存失败则返回 None
     """
-    import cv2
-
-    if frame is None:
-        logger.warning("Cannot save debug frame: frame is None")
-        return None
-
-    # Ensure debug directory exists
-    os.makedirs(debug_dir, exist_ok=True)
-
-    # Clean up old files if needed
-    clean_debug_images(debug_dir, max_files)
-
     try:
-        # Generate filename with timestamp
+        # 确保目录存在
+        os.makedirs(debug_dir, exist_ok=True)
+
+        # 清理旧文件
+        clean_debug_images(debug_dir, max_files)
+
+        # 生成带时间戳的文件名
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        ms = int((time.time() % 1) * 1000)
+        ms = int(time.time() * 1000) % 1000
         filename = f"{prefix}_{timestamp}_{ms:03d}.jpg"
         filepath = os.path.join(debug_dir, filename)
 
-        # Save the frame
-        cv2.imwrite(filepath, frame)
-        logger.debug(f"Saved debug frame to {filepath}")
-        return filepath
+        # 使用 imencode 和 tofile 来处理 Unicode 路径
+        retval, buffer = cv2.imencode(".jpg", frame)
+        if retval:
+            with open(filepath, "wb") as f:
+                buffer.tofile(f)
+            logger.debug(f"已保存调试帧到 {filepath}")
+            return filepath
+        else:
+            logger.error(f"编码调试帧失败: {filepath}")
+            return None
 
     except Exception as e:
-        logger.error(f"Failed to save debug frame: {e}")
+        logger.error(f"保存调试帧时出错: {e}")
         return None

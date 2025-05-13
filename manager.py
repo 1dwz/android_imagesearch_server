@@ -8,7 +8,6 @@ import argparse
 import json
 import logging
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -164,7 +163,7 @@ def start_instance(
         log_file = os.path.join(logs_dir, f"server_{port}.log")
 
         # Open log file
-        with open(log_file, "a") as log_f:
+        with open(log_file, "a", encoding="utf-8") as log_f:
             # Start the process
             process = subprocess.Popen(
                 cmd,
@@ -301,101 +300,99 @@ def stop_instance(port: int) -> Dict[str, Any]:
     Returns:
         Dictionary containing the stop result
     """
-    # Check if the instance is running
-    if not is_port_in_use(port):
-        logger.info(f"No server running on port {port}")
-        return {
-            "port": port,
-            "status": "already_stopped",
-            "message": "No server running on this port",
-        }
-
-    # Get process information
     import psutil
 
+    logger.info(f"尝试停止端口 {port} 上的服务器实例")
+
+    # First check if the instance is running
+    if not is_port_in_use(port):
+        logger.info(f"端口 {port} 未在使用")
+        return {"port": port, "status": "not_running", "message": "端口未在使用"}
+
+    # Try to stop the server gracefully through the API
     try:
-        # Find process using the port
+        url = f"http://127.0.0.1:{port}/internal/shutdown"
+        response = requests.post(url, timeout=REQUEST_TIMEOUT)
+        if response.status_code == 200:
+            logger.info(f"已发送关闭请求到端口 {port}")
+    except Exception as e:
+        logger.warning(f"无法通过 API 停止端口 {port} 上的服务器: {e}")
+
+    # Wait for the server to stop
+    wait_time = 0
+    while wait_time < 5.0:  # Wait up to 5 seconds
+        if not is_port_in_use(port):
+            logger.info(f"端口 {port} 上的服务器已停止")
+            return {"port": port, "status": "stopped", "message": "服务器已停止"}
+        time.sleep(0.5)
+        wait_time += 0.5
+
+    # If the server is still running, try to terminate the process
+    try:
         for conn in psutil.net_connections(kind="inet"):
-            if conn.laddr.port == port and conn.status == "LISTEN":
-                pid = conn.pid
-                logger.info(f"Found process {pid} using port {port}")
+            if (
+                conn.laddr.port == port
+                and conn.status == "LISTEN"
+                and conn.pid is not None
+            ):
+                try:
+                    process = psutil.Process(conn.pid)
+                    logger.info(
+                        f"找到进程 {conn.pid} (名称: {process.name()}) 使用端口 {port}"
+                    )
 
-                # Get process object
-                process = psutil.Process(pid)
-
-                # Stop the process
-                logger.info(f"Stopping process {pid} for port {port}")
-                if sys.platform == "win32":
-                    # On Windows, send Ctrl+C signal
+                    # Try to terminate the process gracefully
                     process.terminate()
-                else:
-                    # On Unix, send SIGTERM
-                    process.send_signal(signal.SIGTERM)
-
-                # Wait for the process to terminate
-                max_wait = 10.0  # seconds
-                wait_interval = 0.5  # seconds
-                start_time = time.time()
-
-                while time.time() - start_time < max_wait:
-                    if not is_port_in_use(port):
-                        logger.info(f"Server on port {port} stopped successfully")
+                    try:
+                        process.wait(timeout=5.0)  # Wait for the process to terminate
+                        logger.info(f"已终止进程 {conn.pid}")
                         return {
                             "port": port,
                             "status": "stopped",
-                            "message": "Server stopped successfully",
+                            "message": f"已终止进程 {conn.pid}",
+                        }
+                    except psutil.TimeoutExpired:
+                        logger.warning(f"进程 {conn.pid} 未能优雅终止，正在强制结束")
+                        process.kill()
+                        process.wait(timeout=2.0)  # Wait for the process to terminate
+                        logger.info(f"已强制结束进程 {conn.pid}")
+                        return {
+                            "port": port,
+                            "status": "stopped",
+                            "message": f"已强制结束进程 {conn.pid}",
                         }
 
-                    # Check if process is still running
-                    try:
-                        process.status()
-                        # Process still exists, wait a bit more
-                        time.sleep(wait_interval)
-                    except psutil.NoSuchProcess:
-                        # Process no longer exists
-                        if is_port_in_use(port):
-                            logger.warning(
-                                f"Process ended but port {port} still in use"
-                            )
-                            break
-                        else:
-                            logger.info(f"Process {pid} terminated for port {port}")
-                            return {
-                                "port": port,
-                                "status": "stopped",
-                                "message": f"Process {pid} terminated",
-                            }
-
-                # If we get here, the process didn't terminate gracefully
-                logger.warning(
-                    f"Timeout waiting for process {pid} to terminate. Killing..."
-                )
-
-                try:
-                    process.kill()
-                    logger.info(f"Killed process {pid} for port {port}")
-                    return {
-                        "port": port,
-                        "status": "killed",
-                        "message": f"Process {pid} killed",
-                    }
-                except Exception as kill_err:
-                    logger.error(f"Failed to kill process {pid}: {kill_err}")
+                except psutil.NoSuchProcess:
+                    logger.warning(f"在尝试终止之前进程 {conn.pid} 已消失")
+                    continue
+                except psutil.AccessDenied:
+                    logger.error(f"无权限终止进程 {conn.pid}")
                     return {
                         "port": port,
                         "status": "error",
-                        "message": f"Failed to kill process: {kill_err}",
+                        "message": f"无权限终止进程 {conn.pid}",
+                    }
+                except Exception as e:
+                    logger.error(f"终止进程 {conn.pid} 时出错: {e}")
+                    return {
+                        "port": port,
+                        "status": "error",
+                        "message": f"终止进程时出错: {str(e)}",
                     }
 
         # If we get here, we didn't find a process for the port
-        logger.warning(f"Port {port} is in use but couldn't find the process")
-        return {
-            "port": port,
-            "status": "error",
-            "message": "Port is in use but couldn't find the process",
-        }
+        if is_port_in_use(port):
+            logger.warning(f"端口 {port} 在使用中，但未找到关联的进程")
+            return {
+                "port": port,
+                "status": "error",
+                "message": "端口在使用中但未找到进程",
+            }
+
+        return {"port": port, "status": "stopped", "message": "服务器已停止"}
+
     except Exception as e:
-        logger.exception(f"Error stopping server on port {port}")
+        logger.error(f"停止端口 {port} 上的服务器时发生错误: {e}")
         return {"port": port, "status": "error", "message": str(e)}
 
 
