@@ -5,7 +5,7 @@ a = Analysis(
     ['manager.py'],
     pathex=[],
     binaries=[],
-    datas=[('multi_config.json', '.'), ('config', 'config'), ('logs', 'logs')],
+    datas=[('multi_config.json', '.'), ('config', 'config')], # Removed ('logs', 'logs')
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
